@@ -14,6 +14,7 @@ public class ClientHandler implements Runnable {
     private String clientIP; // 客户端IP地址
     private boolean isAuthenticated = false; // 认证状态
     private boolean isRunning = true; // 运行状态
+    private boolean isAnonymous = false; // 匿名聊天状态，默认为实名
 
     /**
      * 构造函数
@@ -43,7 +44,8 @@ public class ClientHandler implements Runnable {
                 handleMessages();
             }
         } catch (IOException e) {
-            server.appendLog("处理客户端时出错: " + e.getMessage());
+            // 客户端断开连接或网络错误时，不再打印 "处理客户端时出错"
+            // server.appendLog("处理客户端 " + (username != null ? username : clientIP) + " 时出错: " + e.getMessage());
         } finally {
             disconnect();
         }
@@ -62,11 +64,12 @@ public class ClientHandler implements Runnable {
             // 等待客户端发送认证信息
             String authMessage = reader.readLine();
             if (authMessage == null) {
+                server.appendLog("客户端 " + clientIP + " 在认证前断开连接");
                 return false; // 客户端断开连接
             }
 
             if (authMessage.startsWith("AUTH:")) {
-                String[] parts = authMessage.substring(5).split(":");
+                String[] parts = authMessage.substring(5).split(":", 2); // Limit split to 2 parts
                 if (parts.length == 2) {
                     String inputUsername = parts[0];
                     String inputPassword = parts[1];
@@ -83,7 +86,7 @@ public class ClientHandler implements Runnable {
                             server.logUserAction(username, "登录成功", clientIP);
 
                             // 通知其他用户有新用户加入
-                            server.broadcastMessage("系统消息: " + username + " 加入了聊天室", username);
+                            server.broadcastMessage("系统消息: " + username + " 加入了聊天室", username); // 第二个参数是发送者，不给自己发
 
                             return true;
                         } else {
@@ -97,13 +100,19 @@ public class ClientHandler implements Runnable {
                 } else {
                     writer.println("AUTH_FAIL:认证信息格式错误");
                 }
+            } else {
+                writer.println("AUTH_FAIL:无效的认证请求");
             }
 
             attempts++;
+            if (attempts < maxAttempts && isRunning) {
+                writer.println("AUTH_RETRY:请重试 (" + (maxAttempts - attempts) + " 次剩余)");
+            }
         }
 
         if (attempts >= maxAttempts) {
             writer.println("AUTH_FAIL:尝试次数过多，连接将被断开");
+            server.logUserAction(clientIP, "登录失败(尝试次数过多)", clientIP); // Log with IP if username unknown
         }
 
         return false;
@@ -124,8 +133,9 @@ public class ClientHandler implements Runnable {
             } else {
                 // 普通广播消息
                 if (!message.trim().isEmpty()) {
-                    String broadcastMessage = username + ": " + message;
-                    server.broadcastMessage(broadcastMessage, username);
+                    String senderDisplayName = isAnonymous ? "匿名用户" : username;
+                    String broadcastMessage = senderDisplayName + ": " + message;
+                    server.broadcastMessage(broadcastMessage, username); // 传入真实username用于排除自己
                 }
             }
         }
@@ -140,14 +150,15 @@ public class ClientHandler implements Runnable {
                 writer.println("SYSTEM:" + server.getOnlineUserList());
                 break;
             case "quit":
-                writer.println("SYSTEM:再见！");
-                isRunning = false;
+                writer.println("SYSTEM:您已退出聊天室。再见！");
+                isRunning = false; // 这将导致run方法中的循环结束，并调用disconnect
                 break;
             case "showanonymous":
-                writer.println("SYSTEM:当前聊天方式: 实名聊天"); // 简化实现，默认实名
+                writer.println("SYSTEM:当前聊天方式: " + (isAnonymous ? "匿名聊天" : "实名聊天"));
                 break;
             case "anonymous":
-                writer.println("SYSTEM:匿名聊天功能暂未实现");
+                isAnonymous = !isAnonymous; // 切换状态
+                writer.println("SYSTEM:聊天方式已切换为 " + (isAnonymous ? "匿名聊天" : "实名聊天"));
                 break;
             default:
                 writer.println("SYSTEM:未知命令: " + command);
@@ -161,10 +172,15 @@ public class ClientHandler implements Runnable {
     private void handlePrivateMessage(String message) {
         // 格式: @username message
         int spaceIndex = message.indexOf(' ');
-        if (spaceIndex > 1) {
+        if (spaceIndex > 1 && message.charAt(0) == '@') { // 确保@开头且后面有用户名
             String targetUser = message.substring(1, spaceIndex);
-            String privateMessage = message.substring(spaceIndex + 1);
-            server.sendPrivateMessage(privateMessage, username, targetUser);
+            String privateMessageContent = message.substring(spaceIndex + 1);
+            if (!privateMessageContent.trim().isEmpty()) {
+                // 私聊消息总是实名的，即使发送者处于匿名模式
+                server.sendPrivateMessage(privateMessageContent, username, targetUser);
+            } else {
+                writer.println("SYSTEM:私聊消息内容不能为空");
+            }
         } else {
             writer.println("SYSTEM:私聊格式错误，正确格式: @用户名 消息内容");
         }
@@ -174,8 +190,8 @@ public class ClientHandler implements Runnable {
      * 向客户端发送消息
      */
     public void sendMessage(String message) {
-        if (writer != null) {
-            writer.println("MESSAGE:" + message);
+        if (writer != null && !clientSocket.isClosed()) { // 增加检查socket是否关闭
+            writer.println(message); // 注意：ChatServer中调用此方法时已添加 "MESSAGE:" 或 "SYSTEM:" 前缀
         }
     }
 
@@ -183,13 +199,22 @@ public class ClientHandler implements Runnable {
      * 断开连接
      */
     public void disconnect() {
-        isRunning = false;
-
-        if (isAuthenticated && username != null) {
+        if (!isRunning && username == null && isAuthenticated) {
+            // This case can happen if authentication failed due to max attempts,
+            // and then run() calls disconnect(). We don't want to broadcast leave message.
+        } else if (isAuthenticated && username != null) {
             server.removeOnlineUser(username);
-            server.broadcastMessage("系统消息: " + username + " 离开了聊天室", username);
+            // 只有当用户成功认证后离开，才广播消息和记录日志
+            server.broadcastMessage("系统消息: " + username + " 离开了聊天室", username); // username是发送者，不通知自己
             server.logUserAction(username, "退出聊天室", clientIP);
+        } else if (username == null && !clientIP.isEmpty()) {
+            // 如果用户未成功认证就断开（例如，认证前关闭客户端窗口）
+            server.appendLog("客户端 " + clientIP + " 未认证便断开连接");
         }
+
+
+        isRunning = false; // 确保状态一致
+        isAuthenticated = false; // 重置认证状态
 
         try {
             if (reader != null) reader.close();
@@ -198,7 +223,8 @@ public class ClientHandler implements Runnable {
                 clientSocket.close();
             }
         } catch (IOException e) {
-            server.appendLog("关闭客户端连接时出错: " + e.getMessage());
+            server.appendLog("关闭客户端 " + (username != null ? username : clientIP) + " 连接时出错: " + e.getMessage());
         }
+        // server.appendLog("客户端 " + (username != null ? username : clientIP) + " 连接已关闭");
     }
 }
